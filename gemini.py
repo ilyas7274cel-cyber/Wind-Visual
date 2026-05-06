@@ -15,7 +15,7 @@ warnings.filterwarnings("ignore")
 # GLOBAL CONFIGURATION 
 # ==============================================================
 # Physics & Environment
-U_REF         = 15.0         # Reference wind speed at 10m (m/s)
+U_REF         = 60.0         # Reference wind speed at 10m (m/s)
 Z_REF         = 10.0         # Reference height (m)
 ALPHA         = 0.22         # ABL Power-law exponent
 RHO           = 1.225        # Air density (kg/m^3)
@@ -71,34 +71,41 @@ U[building_mask] = 0
 U = gaussian_filter(U, 0.8)
 Umag_base = np.abs(U)
 
-# Extract 2D Slice EXACTLY at the center (Building stays 100% static)
+# Extract 2D Slice EXACTLY at the center
 iy = NY // 2
 X_slice = X[:, iy, :]
 Z_slice = Z[:, iy, :]
 U_slice = Umag_base[:, iy, :]
 B_mask_slice = building_mask[:, iy, :]
 
-# Calculate 1D Cumulative Force Profile (kN/m vs Height) for the 4th chart
-force_z = np.zeros(NZ)
-total_base_shear = 0
+# Calculate Pressures
 Cp_base = (0.5 * RHO * (U_REF**2 - Umag_base**2)) / Q_DYN
 Cp_base = np.clip(Cp_base, -2.5, 1.2)
 Stress_base = Cp_base * Q_DYN
 
+# -----------------------------------------------------------
+# CORRECTED DRAG FORCE ALGORITHM (Offset Probing)
+# -----------------------------------------------------------
+force_z = np.zeros(NZ)
+total_base_shear = 0
+
 for iz in range(NZ):
     z_val = z[iz]
     for (hx, hy, zb, zt, _) in TIERS:
-        if zb <= z_val <= zt:
-            ix_w = np.argmin(np.abs(x - (CX - hx)))
-            ix_l = np.argmin(np.abs(x - (CX + hx)))
+        if zb <= z_val < zt:
+            # Probe 1.5 grid cells OUTSIDE the geometry to prevent reading internal solid data
+            ix_w = np.argmin(np.abs(x - (CX - hx - dx*1.5))) 
+            ix_l = np.argmin(np.abs(x - (CX + hx + dx*1.5))) 
+            
             iy_mask = (y >= CY - hy) & (y <= CY + hy)
             
             P_w = Stress_base[ix_w, iy_mask, iz]
             P_l = Stress_base[ix_l, iy_mask, iz]
             
+            # Integrate the pressure differential across the width of the tier
             force_per_meter = np.trapz(P_w - P_l, y[iy_mask]) / 1000.0  
-            force_z[iz] = force_per_meter
-            total_base_shear += force_per_meter * dz
+            force_z[iz] = max(force_per_meter, 0) # Ensure no negative drag anomalies
+            total_base_shear += force_z[iz] * dz
             break
 
 # ==============================================================
@@ -120,12 +127,10 @@ ax_cp     = fig.add_subplot(gs[0, 1], facecolor=BG_COLOR)
 ax_stress = fig.add_subplot(gs[1, 0], facecolor=BG_COLOR)
 ax_force  = fig.add_subplot(gs[1, 1], facecolor=BG_COLOR)
 
-# Strict Normalization Scales to prevent flickering colors
 norm_u      = Normalize(vmin=0, vmax=U_REF * 1.35)
 norm_cp     = Normalize(vmin=-2.5, vmax=1.2)
 norm_stress = Normalize(vmin=-2.5 * Q_DYN, vmax=1.2 * Q_DYN)
 
-# Add Colorbars
 cb_vel = fig.colorbar(plt.cm.ScalarMappable(cmap=CMAP, norm=norm_u), ax=ax_vel, pad=0.02)
 cb_vel.set_label('Wind Velocity [m/s]', color=TEXT_COLOR)
 cb_cp = fig.colorbar(plt.cm.ScalarMappable(cmap=CMAP, norm=norm_cp), ax=ax_cp, pad=0.02)
@@ -138,7 +143,7 @@ for cb in [cb_vel, cb_cp, cb_stress]: cb.ax.yaxis.set_tick_params(color=TEXT_COL
 # Setup 4th Panel (Static Force Profile)
 ax_force.plot(force_z, z, color='#00f2ff', linewidth=3)
 ax_force.fill_betweenx(z, 0, force_z, color='#00f2ff', alpha=0.2)
-ax_force.set_title("Total Building Drag Force Profile (Static)", color='#f8fafc', fontsize=12, pad=10)
+ax_force.set_title("Total Building Drag Force Profile (Corrected)", color='#f8fafc', fontsize=12, pad=10)
 ax_force.set_xlabel("Drag Force per meter height [kN/m]")
 ax_force.set_ylabel("Elevation (Z) [m]")
 ax_force.set_ylim(0, LZ)
@@ -152,32 +157,26 @@ for (_, _, zb, zt, label) in TIERS:
 # 3. ANIMATION LOOP (Traveling Wind Gusts left-to-right)
 # ==============================================================
 def update(frame):
-    # Remove previous contour lines for the new frame
     for ax in [ax_vel, ax_cp, ax_stress]:
         for c in ax.collections: c.remove()
         [p.remove() for p in reversed(ax.patches)]
     
-    # Mathematical Traveling Wave (Simulates wind moving left to right)
-    # sin(kX - wt): standard physics formula for a wave propagating in the +X direction
+    # Mathematical Traveling Wave
     gust_wave = 0.15 * np.sin(0.04 * X_slice - 0.3 * frame) + 0.05 * np.sin(0.1 * X_slice - 0.5 * frame)
     
-    # Apply gust wave to velocity field
     U_anim = U_slice * (1.0 + gust_wave)
-    U_anim[B_mask_slice] = 0  # Enforce 0 inside the static building
+    U_anim[B_mask_slice] = 0 
     
-    # Recalculate physical properties based on the animated wind
     Cp_anim = (0.5 * RHO * (U_REF**2 - U_anim**2)) / Q_DYN
     Cp_anim = np.clip(Cp_anim, -2.5, 1.2)
-    Cp_anim[B_mask_slice] = 1.0  # High pressure locked on the building
+    Cp_anim[B_mask_slice] = 1.0  
     
     Stress_anim = Cp_anim * Q_DYN
     
-    # Redraw Heatmaps
     ax_vel.contourf(X_slice, Z_slice, U_anim, levels=45, cmap=CMAP, norm=norm_u)
     ax_cp.contourf(X_slice, Z_slice, Cp_anim, levels=45, cmap=CMAP, norm=norm_cp)
     ax_stress.contourf(X_slice, Z_slice, Stress_anim, levels=45, cmap=CMAP, norm=norm_stress)
     
-    # Draw completely STATIC building silhouettes
     for ax, title in zip([ax_vel, ax_cp, ax_stress], ["Velocity Magnitude", "Pressure Coefficient (Cp)", "Wind Stress (Pascals)"]):
         ax.set_title(title, color=TEXT_COLOR, fontsize=12, pad=10)
         ax.set_xlabel("X [m]"); ax.set_ylabel("Z [m]")
@@ -186,5 +185,29 @@ def update(frame):
 
     return []
 
-ani = animation.FuncAnimation(fig, update, frames=300, interval=ANIM_INTERVAL, blit=False)
+# ani = animation.FuncAnimation(fig, update, frames=300, interval=ANIM_INTERVAL, blit=False)
+# plt.show()
+
+ani = animation.FuncAnimation(
+    fig,
+    update,
+    frames=300,
+    interval=ANIM_INTERVAL,
+    blit=False
+)
+
+# -------------------------------
+# SAVE AS GIF
+# -------------------------------
+print("Saving animation as GIF...")
+
+ani.save(
+    "wind_cfd_animation.gif",
+    writer="pillow",
+    fps=25,
+    dpi=100
+)
+
+print("Saved successfully: wind_cfd_animation.gif")
+
 plt.show()
