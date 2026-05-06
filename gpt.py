@@ -1,116 +1,182 @@
 import numpy as np
-import pyvista as pv
+import matplotlib.pyplot as plt
+import matplotlib.animation as animation
+from scipy.ndimage import gaussian_filter
+from scipy.interpolate import RegularGridInterpolator
 
 # -------------------------------
 # DOMAIN
 # -------------------------------
-nx, ny, nz = 50, 25, 25
-Lx, Ly, Lz = 10.0, 5.0, 5.0
+Lx, Ly, Lz = 200, 120, 120
+Nx, Ny, Nz = 60, 40, 40
 
-dx, dy, dz = Lx/nx, Ly/ny, Lz/nz
-dt = 0.001  # time step (VERY IMPORTANT)
+x = np.linspace(0, Lx, Nx)
+y = np.linspace(0, Ly, Ny)
+z = np.linspace(0, Lz, Nz)
 
-# Fields
-u = np.ones((nx, ny, nz)) * 5.0
-v = np.zeros_like(u)
-w = np.zeros_like(u)
-p = np.zeros_like(u)
-
-k = np.ones_like(u) * 0.05
-eps = np.ones_like(u) * 0.01
-
-rho = 1.225
-nu = 1.5e-5
-
-# Relaxation factors (CRITICAL)
-alpha_u = 0.5
-alpha_k = 0.5
-alpha_eps = 0.5
+X, Y, Z = np.meshgrid(x, y, z, indexing='ij')
 
 # -------------------------------
-# BUILDING
+# BUILDING (simple cuboid)
 # -------------------------------
-solid = np.zeros_like(u, dtype=bool)
-solid[20:30, 10:15, 0:15] = True
+cx, cy = Lx * 0.4, Ly * 0.5
+bx, by, bz = 15, 15, 80
 
-# -------------------------------
-# k-epsilon constants
-# -------------------------------
-C_mu = 0.09
-C1 = 1.44
-C2 = 1.92
-
-nt = 200
-
-for t in range(nt):
-
-    u_old = u.copy()
-
-    # Turbulent viscosity (SAFE)
-    nu_t = C_mu * (k**2 / (eps + 1e-5))
-    nu_t = np.clip(nu_t, 0, 1.0)
-
-    nu_eff = nu + nu_t
-
-    # -------------------------------
-    # Momentum (STABLE FORM)
-    # -------------------------------
-    convection = (u_old[1:-1,1:-1,1:-1] *
-                 (u_old[1:-1,1:-1,1:-1] - u_old[:-2,1:-1,1:-1]) / dx)
-
-    diffusion = nu_eff[1:-1,1:-1,1:-1] * (
-        (u_old[2:,1:-1,1:-1] - 2*u_old[1:-1,1:-1,1:-1] + u_old[:-2,1:-1,1:-1]) / dx**2
-    )
-
-    u_new = u_old[1:-1,1:-1,1:-1] + dt * (-convection + diffusion)
-
-    # Under-relaxation
-    u[1:-1,1:-1,1:-1] = (1-alpha_u)*u_old[1:-1,1:-1,1:-1] + alpha_u*u_new
-
-    # -------------------------------
-    # Turbulence equations (STABLE)
-    # -------------------------------
-    production = nu_t * (u**2)
-
-    k_new = k + dt * (production - eps)
-    eps_new = eps + dt * (C1*production - C2*eps)
-
-    # Under-relaxation
-    k = (1-alpha_k)*k + alpha_k*k_new
-    eps = (1-alpha_eps)*eps + alpha_eps*eps_new
-
-    # CLIPPING (VERY IMPORTANT)
-    k = np.clip(k, 1e-6, 10)
-    eps = np.clip(eps, 1e-6, 10)
-
-    # -------------------------------
-    # Boundary conditions
-    # -------------------------------
-    u[0,:,:] = 5.0
-    u[-1,:,:] = u[-2,:,:]
-
-    u[solid] = 0
-    v[solid] = 0
-    w[solid] = 0
-
-    if t % 20 == 0:
-        print(f"Step {t}/{nt}")
+building = ((X > cx-bx) & (X < cx+bx) &
+            (Y > cy-by) & (Y < cy+by) &
+            (Z < bz))
 
 # -------------------------------
-# VISUALIZATION
+# FLOW FIELD (improved analytic RANS-style)
 # -------------------------------
-grid = pv.ImageData()
+U_ref = 10.0
 
-grid.dimensions = np.array(u.shape) + 1
-grid.spacing = (dx, dy, dz)
-grid.origin = (0, 0, 0)
+U = np.ones_like(X) * U_ref
+V = np.zeros_like(U)
+W = np.zeros_like(U)
 
-vel_mag = np.sqrt(u**2 + v**2 + w**2)
+# Wake + curvature effects
+wake = np.exp(-((X-(cx+bx))**2)/800 - ((Y-cy)**2)/400 - ((Z-40)**2)/900)
+U -= 5 * wake
+W += 2 * wake
 
-grid.cell_data["velocity"] = vel_mag.flatten(order="F")
-grid.cell_data["pressure"] = p.flatten(order="F")
+# Side flow
+side = np.exp(-((Y-(cy+by))**2)/200) + np.exp(-((Y-(cy-by))**2)/200)
+V += 2 * side
 
-plotter = pv.Plotter()
-plotter.add_volume(grid, scalars="velocity", opacity="sigmoid")
-plotter.add_axes()
-plotter.show()
+# Smooth field
+U = gaussian_filter(U, 1.2)
+V = gaussian_filter(V, 1.2)
+W = gaussian_filter(W, 1.2)
+
+U[building] = 0
+V[building] = 0
+W[building] = 0
+
+Umag = np.sqrt(U**2 + V**2 + W**2)
+Umag = np.clip(Umag, 0, 2*U_ref)
+
+# -------------------------------
+# TURBULENCE (k-epsilon approx)
+# -------------------------------
+k_field = 0.05 * Umag**2
+eps_field = 0.1 * k_field
+
+k_field = np.clip(k_field, 1e-6, 20)
+eps_field = np.clip(eps_field, 1e-6, 50)
+
+# -------------------------------
+# INTERPOLATORS
+# -------------------------------
+interp_U = RegularGridInterpolator((x,y,z), U, bounds_error=False, fill_value=0)
+interp_V = RegularGridInterpolator((x,y,z), V, bounds_error=False, fill_value=0)
+interp_W = RegularGridInterpolator((x,y,z), W, bounds_error=False, fill_value=0)
+
+def get_vel(p):
+    u = interp_U(p)
+    v = interp_V(p)
+    w = interp_W(p)
+    return np.column_stack([u,v,w])
+
+# -------------------------------
+# RK4 PARTICLE INTEGRATION
+# -------------------------------
+def rk4(p, dt):
+    k1 = get_vel(p)
+    k2 = get_vel(p + 0.5*dt*k1)
+    k3 = get_vel(p + 0.5*dt*k2)
+    k4 = get_vel(p + dt*k3)
+    return p + (dt/6)*(k1 + 2*k2 + 2*k3 + k4)
+
+# -------------------------------
+# PARTICLES
+# -------------------------------
+N = 150
+px = np.random.uniform(0, 5, N)
+py = np.random.uniform(10, Ly-10, N)
+pz = np.random.uniform(5, Lz-10, N)
+
+trail_len = 12
+trail_x = np.full((N, trail_len), np.nan)
+trail_y = np.full((N, trail_len), np.nan)
+trail_z = np.full((N, trail_len), np.nan)
+
+# -------------------------------
+# FIGURE
+# -------------------------------
+fig = plt.figure(figsize=(14,8))
+ax = fig.add_subplot(111, projection='3d')
+
+ax.set_facecolor('#0a0f1a')
+fig.patch.set_facecolor('#0a0f1a')
+
+# Building
+ax.bar3d(cx-bx, cy-by, 0, 2*bx, 2*by, bz,
+         color='cyan', alpha=0.3)
+
+sc = ax.scatter([],[],[], c=[], cmap='jet', s=10)
+
+lines = []
+for _ in range(N):
+    l, = ax.plot([],[],[], color='white', alpha=0.2)
+    lines.append(l)
+
+ax.set_xlim(0,Lx)
+ax.set_ylim(0,Ly)
+ax.set_zlim(0,Lz)
+
+# -------------------------------
+# ANIMATION
+# -------------------------------
+def update(frame):
+    global px, py, pz
+    global trail_x, trail_y, trail_z
+
+    pts = np.column_stack([px,py,pz])
+
+    # RK4 + substeps
+    for _ in range(4):
+        pts = rk4(pts, 0.5)
+
+    px, py, pz = pts[:,0], pts[:,1], pts[:,2]
+
+    # reset particles
+    mask = (px>Lx)|(py<0)|(py>Ly)|(pz<0)|(pz>Lz)
+    px[mask] = np.random.uniform(0,5,np.sum(mask))
+    py[mask] = np.random.uniform(10,Ly-10,np.sum(mask))
+    pz[mask] = np.random.uniform(5,Lz-10,np.sum(mask))
+
+    # update trails
+    trail_x = np.roll(trail_x,1,axis=1)
+    trail_y = np.roll(trail_y,1,axis=1)
+    trail_z = np.roll(trail_z,1,axis=1)
+
+    trail_x[:,0] = px
+    trail_y[:,0] = py
+    trail_z[:,0] = pz
+
+    # smooth trails
+    trail_x[:] = gaussian_filter(trail_x,0.7)
+    trail_y[:] = gaussian_filter(trail_y,0.7)
+    trail_z[:] = gaussian_filter(trail_z,0.7)
+
+    # velocity coloring
+    vel = get_vel(pts)
+    speed = np.linalg.norm(vel,axis=1)
+
+    sc._offsets3d = (px,py,pz)
+    sc.set_array(speed)
+    sc.set_sizes(10 + 30*(speed/U_ref))
+
+    # update lines
+    for i,l in enumerate(lines):
+        l.set_data(trail_x[i], trail_y[i])
+        l.set_3d_properties(trail_z[i])
+
+    ax.view_init(elev=25, azim=frame*0.4)
+
+    return [sc] + lines
+
+ani = animation.FuncAnimation(fig, update, interval=40)
+
+plt.show()
